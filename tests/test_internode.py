@@ -13,7 +13,12 @@ import test_low_latency
 
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup):
     # Settings
-    num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
+    num_tokens = int(os.environ.get('EP_TEST_NUM_TOKENS', '4096'))
+    hidden = int(os.environ.get('EP_TEST_HIDDEN', '7168'))
+    num_topk_groups = int(os.environ.get('EP_TEST_NUM_TOPK_GROUPS', str(min(num_nodes, 4))))
+    num_topk = int(os.environ.get('EP_TEST_NUM_TOPK', '8'))
+    num_experts = int(os.environ.get('EP_TEST_NUM_EXPERTS', str((256 // num_ranks) * num_ranks)))
+
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
@@ -22,6 +27,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_e4m3 = per_token_cast_to_fp8(x)
+    x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
@@ -139,14 +145,16 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
-                    combine_args = {'x': recv_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
+                    bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                    bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                    combine_args = {'x': recv_x, 'bias': (bias_0, bias_1), 'handle': handle, 'config': config, 'async_finish': async_mode}
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
                         combine_args.update({'previous_event': buffer.capture()})
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
-                    check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
+                    check_x = (combined_x.float() - bias_0.float() - bias_1.float()) / is_token_in_rank.sum(dim=1).unsqueeze(1)
                     ref_x = x_pure_rand if current_x is x_pure_rand else x
                     assert calc_diff(check_x, ref_x) < 5e-6
                     if with_topk:
@@ -219,12 +227,12 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 def test_loop(local_rank: int, num_local_ranks: int):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    test_ll_compatibility = True
+    test_ll_compatibility = os.getenv('EP_TEST_LL_COMPATIBILITY', False)
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
-    num_qps_per_rank = max(num_sms // 2, ll_num_experts // num_ranks if test_ll_compatibility else 0)
+    num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if test_ll_compatibility else 0)
 
     buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank)
@@ -241,7 +249,11 @@ def test_loop(local_rank: int, num_local_ranks: int):
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
 
+    # Destroy the communication group
+    dist.barrier()
+    dist.destroy_process_group()
+
 
 if __name__ == '__main__':
-    num_processes = 8
+    num_processes = int(os.getenv('EP_TEST_NUM_PROCESSES', '8'))
     torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)

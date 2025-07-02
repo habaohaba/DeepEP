@@ -5,20 +5,23 @@
 #include "exception.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
+
+#ifndef DISABLE_NVSHMEM
 #include "ibgda_device.cuh"
+#endif
 
 namespace deep_ep {
 
 namespace intranode {
 
 template<int kNumRanks>
-__global__ void barrier(int** task_fifo_ptrs, int head, int rank) {
-    barrier_device<kNumRanks>(task_fifo_ptrs, head, rank);
+__global__ void barrier(int** barrier_signal_ptrs, int rank) {
+    barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
 }
 
-void barrier(int** task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream_t stream) {
+void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream) {
 #define BARRIER_LAUNCH_CASE(ranks) \
-    LAUNCH_KERNEL(&cfg, barrier<ranks>, task_fifo_ptrs, head, rank); \
+    LAUNCH_KERNEL(&cfg, barrier<ranks>, barrier_signal_ptrs, rank); \
     break
 
     SETUP_LAUNCH_CONFIG(1, 32, stream);
@@ -30,6 +33,7 @@ void barrier(int** task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream
 
 namespace internode {
 
+#ifndef DISABLE_NVSHMEM
 nvshmem_team_t cpu_rdma_team = NVSHMEM_TEAM_INVALID;
 nvshmem_team_config_t cpu_rdma_team_config;
 
@@ -58,12 +62,6 @@ int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks
         EP_HOST_ASSERT(cpu_rdma_team != NVSHMEM_TEAM_INVALID);
     }
 
-    // TODO: we still use `nvshmem_barrier` under IBRC mode, which should be switch to IBGDA mode later
-    nvshmemi_device_host_state_t* dev_state_ptr = nullptr;
-    CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&dev_state_ptr), nvshmemi_device_state_d));
-
-    bool ibgda_is_initialized = false;
-    CUDA_CHECK(cudaMemcpy(&dev_state_ptr->ibgda_is_initialized, &ibgda_is_initialized, sizeof(bool), cudaMemcpyHostToDevice));
     nvshmem_barrier_all();
     return nvshmem_my_pe();
 }
@@ -87,6 +85,7 @@ void finalize() {
     }
     nvshmem_finalize();
 }
+#endif
 
 } // namespace internode
 

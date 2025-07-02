@@ -1,6 +1,7 @@
+import inspect
+import numpy as np
 import os
 import sys
-import numpy as np
 import torch
 import torch.distributed as dist
 from typing import Optional
@@ -12,14 +13,18 @@ def init_dist(local_rank: int, num_local_ranks: int):
     port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
-    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
-    dist.init_process_group(
-        backend='nccl',
-        init_method=f'tcp://{ip}:{port}',
-        world_size=num_nodes * num_local_ranks,
-        rank=node_rank * num_local_ranks + local_rank
-    )
+    sig = inspect.signature(dist.init_process_group)
+    params = {
+        'backend': 'nccl',
+        'init_method': f'tcp://{ip}:{port}',
+        'world_size': num_nodes * num_local_ranks,
+        'rank': node_rank * num_local_ranks + local_rank,
+    }
+    if 'device_id' in sig.parameters:
+        # noinspection PyTypeChecker
+        params['device_id'] = torch.device(f'cuda:{local_rank}')
+    dist.init_process_group(**params)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
     torch.cuda.set_device(local_rank)
@@ -43,6 +48,9 @@ def per_token_cast_to_fp8(x: torch.Tensor):
 
 
 def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
+    if x_scales.dtype == torch.int:
+        x_scales = x_scales.view(dtype=torch.int8).to(torch.int) << 23
+        x_scales = x_scales.view(dtype=torch.float)
     x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, 128)
     x_scales = x_scales.view(x_fp8.size(0), -1, 1)
     return (x_fp32 * x_scales).view(x_fp8.shape).to(torch.bfloat16)
@@ -71,7 +79,7 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
     return (scores * mask).view(num_tokens, num_experts)
 
 
-def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
+def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
